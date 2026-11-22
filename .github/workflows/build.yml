@@ -1,0 +1,46 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build-full.log
+      - name: Ringkas error build
+        if: always()
+        run: |
+          {
+            echo "=== RINGKASAN ERROR ($(date -u)) ==="
+            grep -E "^e: |error:|FAILURE|What went wrong|Execution failed|Could not resolve|Platform declaration clash" -A3 build-full.log | head -300
+          } > build-errors.txt || true
+          cat build-errors.txt >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Unggah log build (selalu)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build-full.log
+            build-errors.txt
+          if-no-files-found: ignore
+      - name: Unggah APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeAgent-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
