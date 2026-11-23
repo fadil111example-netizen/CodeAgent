@@ -12,13 +12,15 @@ import java.util.concurrent.TimeUnit
 
 class LlmError(val code: Int, message: String) : Exception(message)
 class ToolSpec(val name: String, val description: String, val schema: JSONObject)
-class LlmResult(val text: String, val calls: List<ToolCall>)
+class LlmResult(val text: String, val calls: List<ToolCall>, val truncated: Boolean = false)
 
 object Llm {
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
+    /** Klien streaming: putus bila tidak ada data selama 120 detik (macet). */
+    val streamHttp: OkHttpClient = http.newBuilder().readTimeout(120, TimeUnit.SECONDS).build()
     private val JSON_TYPE = "application/json".toMediaType()
 
     fun stream(
@@ -60,13 +62,14 @@ object Llm {
         val rb = Request.Builder().url(p.baseUrl.trimEnd('/') + "/chat/completions")
             .post(body.toString().toRequestBody(JSON_TYPE))
         if (key.isNotBlank()) rb.header("Authorization", "Bearer $key")
-        val call = http.newCall(rb.build())
+        val call = streamHttp.newCall(rb.build())
         onCall(call)
         call.execute().use { resp ->
             if (!resp.isSuccessful) throw LlmError(resp.code, resp.body?.string()?.take(600) ?: "HTTP ${resp.code}")
             val src = resp.body!!.source()
             val text = StringBuilder()
             val acc = sortedMapOf<Int, Array<StringBuilder>>() // id, nama, argumen
+            var truncated = false
             while (true) {
                 val line = src.readUtf8Line() ?: break
                 if (!line.startsWith("data:")) continue
@@ -76,6 +79,7 @@ object Llm {
                 val j = try { JSONObject(d) } catch (e: Exception) { continue }
                 j.optJSONObject("error")?.let { throw LlmError(it.optInt("code", 500), it.str("message")) }
                 val ch = j.optJSONArray("choices")?.optJSONObject(0) ?: continue
+                if (ch.str("finish_reason") == "length") truncated = true
                 val delta = ch.optJSONObject("delta") ?: continue
                 val c = delta.str("content")
                 if (c.isNotEmpty()) { text.append(c); onText(c) }
@@ -97,7 +101,7 @@ object Llm {
                 ToolCall(it[0].toString().ifEmpty { "call_" + UUID.randomUUID().toString().take(8) }, it[1].toString(),
                     it[2].toString().ifBlank { "{}" })
             }
-            return LlmResult(text.toString(), calls)
+            return LlmResult(text.toString(), calls, truncated)
         }
     }
 
@@ -136,23 +140,35 @@ object Llm {
             i++
         }
         val body = JSONObject().put("model", model).put("max_tokens", 8192).put("stream", true)
-            .put("system", system).put("messages", ms)
+            .put("messages", ms)
         if (tools.isNotEmpty()) body.put("tools", JSONArray().also { a ->
             tools.forEach {
                 a.put(JSONObject().put("name", it.name).put("description", it.description).put("input_schema", it.schema))
             }
         })
+        val cache = p.baseUrl.contains("anthropic.com")
+        val eph = { JSONObject().put("type", "ephemeral") }
+        if (cache) {
+            body.put("system", JSONArray().put(JSONObject().put("type", "text").put("text", system).put("cache_control", eph())))
+            if (ms.length() > 0) {
+                val last = ms.getJSONObject(ms.length() - 1)
+                val c = last.get("content")
+                if (c is String) last.put("content", JSONArray().put(JSONObject().put("type", "text").put("text", c).put("cache_control", eph())))
+                else if (c is JSONArray && c.length() > 0) c.getJSONObject(c.length() - 1).put("cache_control", eph())
+            }
+        } else body.put("system", system)
         val rb = Request.Builder().url(p.baseUrl.trimEnd('/') + "/messages")
             .header("anthropic-version", "2023-06-01")
             .post(body.toString().toRequestBody(JSON_TYPE))
         if (key.isNotBlank()) rb.header("x-api-key", key).header("Authorization", "Bearer $key")
-        val call = http.newCall(rb.build())
+        val call = streamHttp.newCall(rb.build())
         onCall(call)
         call.execute().use { resp ->
             if (!resp.isSuccessful) throw LlmError(resp.code, resp.body?.string()?.take(600) ?: "HTTP ${resp.code}")
             val src = resp.body!!.source()
             val text = StringBuilder()
             val tools2 = sortedMapOf<Int, Array<StringBuilder>>() // id, nama, argumen
+            var truncated = false
             while (true) {
                 val line = src.readUtf8Line() ?: break
                 if (!line.startsWith("data:")) continue
@@ -175,6 +191,7 @@ object Llm {
                             "input_json_delta" -> tools2[j.optInt("index")]?.get(2)?.append(dl.str("partial_json"))
                         }
                     }
+                    "message_delta" -> if (j.optJSONObject("delta")?.str("stop_reason") == "max_tokens") truncated = true
                     "error" -> {
                         val er = j.optJSONObject("error")
                         val code = when (er?.str("type")) {
@@ -191,9 +208,27 @@ object Llm {
             val calls = tools2.values.map {
                 ToolCall(it[0].toString(), it[1].toString(), it[2].toString().ifBlank { "{}" })
             }
-            return LlmResult(text.toString(), calls)
+            return LlmResult(text.toString(), calls, truncated)
         }
     }
+
+    // ---------- Klasifikasi error ----------
+    private val QUOTA_WORDS = listOf("quota", "insufficient", "exceeded your", "billing", "credit", "balance", "usage limit", "daily limit", "per day", "exhausted", "limit reached")
+    private val SHORT_WORDS = listOf("per minute", "per second", "rpm", "tpm", "try again in", "retry after", "too many requests", "rate limit")
+
+    /** 1 = kuota habis (tandai sampai besok), 2 = batas sementara (tunggu lalu coba lagi), 0 = bukan batas. */
+    fun limitKind(code: Int, msg: String): Int {
+        val m = msg.lowercase()
+        val quota = QUOTA_WORDS.any { m.contains(it) }
+        val short = SHORT_WORDS.any { m.contains(it) } && !m.contains("per day") && !m.contains("daily")
+        if (code == 402) return 1
+        if ((code == 429 || code == 403 || code == 400) && quota && !short) return 1
+        return if (code == 429 || code == 529) 2 else 0
+    }
+
+    fun looksOffline(e: Exception): Boolean =
+        e is java.net.UnknownHostException || e is java.net.ConnectException ||
+            (e.message ?: "").let { it.contains("Unable to resolve host") || it.contains("Network is unreachable") }
 
     // ---------- Ambil daftar model ----------
     fun fetchModels(p: Provider, key: String): List<String> {

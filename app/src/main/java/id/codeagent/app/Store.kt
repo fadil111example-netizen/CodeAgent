@@ -74,6 +74,10 @@ object Store {
         get() = sp.getString("theme", "system") ?: "system"
         set(v) = sp.edit().putString("theme", v).apply()
 
+    var ctxWindow: Int
+        get() = sp.getInt("ctxWindow", 128000)
+        set(v) = sp.edit().putInt("ctxWindow", v).apply()
+
     var lastFolder: String
         get() = sp.getString("lastFolder", "/storage/emulated/0/CodeAgent") ?: ""
         set(v) = sp.edit().putString("lastFolder", v).apply()

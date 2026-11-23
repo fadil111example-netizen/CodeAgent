@@ -10,6 +10,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -59,6 +62,7 @@ fun AppRoot(vm: AppViewModel) {
     }
     if (vm.showModelSheet) ModelSheet(vm)
     vm.pendingAsk?.let { PermDialog(vm, it) }
+    vm.pendingQuestion?.let { QuestionDialog(vm, it) }
 }
 
 // ---------------------------------------------------------------- Beranda
@@ -153,6 +157,7 @@ fun ChatScreen(vm: AppViewModel, s: ChatSession) {
     val ctx = LocalContext.current
     var input by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
+    LaunchedEffect(vm.prefill) { if (vm.prefill.isNotEmpty()) { input = vm.prefill; vm.prefill = "" } }
     val list = rememberLazyListState()
     val lastLen = (s.items.lastOrNull() as? ChatItem.Assistant)?.text?.length ?: 0
     LaunchedEffect(s.items.size, lastLen) { if (s.items.isNotEmpty()) list.scrollToItem(s.items.size - 1) }
@@ -162,10 +167,16 @@ fun ChatScreen(vm: AppViewModel, s: ChatSession) {
             IconButton({ vm.currentId = null }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Kembali") }
             Column(Modifier.weight(1f)) {
                 Text(s.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                OutlinedButton({ vm.showModelSheet = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                    modifier = Modifier.height(32.dp)) {
-                    Text(vm.modelLabel(s.model), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, false))
-                    Icon(Icons.Default.ArrowDropDown, null)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton({ vm.showModelSheet = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp).weight(1f, false)) {
+                        Text(vm.modelLabel(s.model), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, false))
+                        Icon(Icons.Default.ArrowDropDown, null)
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(selected = s.agent == "build", onClick = { vm.switchAgent(s, "build") }, label = { Text("Build", fontSize = 11.sp) })
+                    Spacer(Modifier.width(4.dp))
+                    FilterChip(selected = s.agent == "plan", onClick = { vm.switchAgent(s, "plan") }, label = { Text("Plan", fontSize = 11.sp) })
                 }
             }
             Box {
@@ -191,9 +202,25 @@ fun ChatScreen(vm: AppViewModel, s: ChatSession) {
                 if (s.running) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 4.dp)) }
             }
         }
+        if (s.todos.isNotEmpty()) {
+            var open by remember { mutableStateOf(false) }
+            val done = s.todos.count { it.second == "completed" }
+            Surface(Modifier.fillMaxWidth().padding(horizontal = 10.dp).clickable { open = !open }, shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer) {
+                Column(Modifier.padding(10.dp)) {
+                    Text("Rencana  $done/${s.todos.size}  ${if (open) "▾" else "▸"}", fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    val shown = if (open) s.todos else listOfNotNull(s.todos.firstOrNull { it.second == "in_progress" } ?: s.todos.firstOrNull { it.second != "completed" })
+                    shown.forEach { t ->
+                        Text((when (t.second) { "completed" -> "☑ "; "in_progress" -> "◐ "; else -> "☐ " }) + t.first, fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                }
+            }
+        }
         val cmds = remember(input, vm.commands, s.root) {
             if (input.startsWith("/") && !input.contains(' '))
-                (listOf("init", "model", "effort", "compact", "clear", "bantuan") + vm.commands.map { it.name } + vm.projectCommands(s.root).map { it.name })
+                (listOf("init", "plan", "build", "undo", "port", "model", "effort", "compact", "clear", "bantuan") + vm.commands.map { it.name } + vm.projectCommands(s.root).map { it.name })
                     .filter { it.startsWith(input.drop(1)) }.take(8) else emptyList()
         }
         if (cmds.isNotEmpty()) Row(Modifier.padding(horizontal = 8.dp)) {
@@ -206,7 +233,7 @@ fun ChatScreen(vm: AppViewModel, s: ChatSession) {
                 Box {
                     IconButton({ plus = true }) { Icon(Icons.Default.Add, "Perintah cepat") }
                     DropdownMenu(plus, { plus = false }) {
-                        listOf("/init" to "Buat AGENTS.md", "/compact" to "Padatkan percakapan", "/model" to "Ganti model", "/bantuan" to "Bantuan").forEach { (c, d) ->
+                        listOf("/init" to "Buat AGENTS.md", "/plan" to "Mode rencana", "/build" to "Mode kerja", "/undo" to "Batalkan giliran terakhir", "/port" to "Salin fitur dari proyek lain", "/compact" to "Padatkan percakapan", "/model" to "Ganti model", "/bantuan" to "Bantuan").forEach { (c, d) ->
                             DropdownMenuItem(text = { Text("$c  –  $d") }, onClick = { plus = false; input = "$c " })
                         }
                     }
@@ -333,4 +360,29 @@ fun PermDialog(vm: AppViewModel, a: PermAsk) {
             }
         },
         dismissButton = { TextButton({ vm.answerAsk(true, true) }) { Text("Selalu izinkan ${a.group}") } })
+}
+
+
+@Composable
+fun QuestionDialog(vm: AppViewModel, q: QAsk) {
+    val answers = remember(q) { mutableStateListOf<String>().also { l -> repeat(q.items.size) { l.add("") } } }
+    AlertDialog(onDismissRequest = { vm.answerQuestions("The user skipped the questions.") },
+        title = { Text("Agen bertanya") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                q.items.forEachIndexed { i, item ->
+                    Text(item.question, fontWeight = FontWeight.SemiBold)
+                    if (item.options.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        item.options.forEach { o -> FilterChip(selected = answers[i] == o, onClick = { answers[i] = o }, label = { Text(o) }) }
+                    }
+                    OutlinedTextField(answers[i], { v -> answers[i] = v }, placeholder = { Text("Jawaban sendiri…") }, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = {
+            TextButton({
+                vm.answerQuestions(q.items.mapIndexed { i, x -> "Q: ${x.question}\nA: ${answers[i].ifBlank { "(no answer)" }}" }.joinToString("\n\n"))
+            }) { Text("Kirim") }
+        },
+        dismissButton = { TextButton({ vm.answerQuestions("The user skipped the questions.") }) { Text("Lewati") } })
 }

@@ -20,6 +20,8 @@ import java.util.Locale
 import java.util.UUID
 
 data class Cand(val provider: Provider, val key: String, val keyIdx: Int, val model: String)
+class QItem(val question: String, val options: List<String>)
+class QAsk(val items: List<QItem>, val answer: CompletableDeferred<String>)
 class PermAsk(val group: String, val tool: String, val detail: String, val answer: CompletableDeferred<Boolean>)
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -34,6 +36,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var commands by mutableStateOf(Store.commands); private set
     var userSkills by mutableStateOf(Store.skills); private set
     var selected by mutableStateOf(Store.selected); private set
+    var ctxWindow by mutableStateOf(Store.ctxWindow); private set
+    var prefill by mutableStateOf("")
     var autoSwitch by mutableStateOf(Store.autoSwitch); private set
     var autoApprove by mutableStateOf(Store.autoApprove); private set
     var voice by mutableStateOf(Store.voice); private set
@@ -59,6 +63,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var showSettings by mutableStateOf(false)
     var showModelSheet by mutableStateOf(false)
     var pendingAsk by mutableStateOf<PermAsk?>(null); private set
+    var pendingQuestion by mutableStateOf<QAsk?>(null); private set
     var toast by mutableStateOf<String?>(null)
     var permTick by mutableIntStateOf(0)
     var inForeground = true
@@ -112,6 +117,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return p.name + "/" + m
     }
 
+    fun ubahCtxWindow(v: Int) { ctxWindow = v; Store.ctxWindow = v }
+
     fun chooseModel(s: ChatSession?, sel: String) { s?.model = sel; ubahSelected(sel); s?.let { persist(it) } }
 
     // ---- pemilihan provider/kunci + pergantian otomatis ----
@@ -150,6 +157,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         try { return d.await() } finally { pendingAsk = null }
     }
 
+    suspend fun askQuestions(arr: org.json.JSONArray): String {
+        val items = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+            .map { o -> QItem(o.str("question"), o.optJSONArray("options")?.strings() ?: emptyList()) }
+            .filter { it.question.isNotBlank() }
+        if (items.isEmpty()) return "No questions provided."
+        val d = CompletableDeferred<String>()
+        pendingQuestion = QAsk(items, d)
+        try { return d.await() } finally { pendingQuestion = null }
+    }
+
+    fun answerQuestions(text: String) { pendingQuestion?.answer?.complete(text) }
+
+    private var bgCounter = 0
+
+    fun runBackground(s: ChatSession, cmd: String, dir: File): String {
+        val id = "bg${++bgCounter}"
+        Thread {
+            val (out, code) = try { Tools.exec(cmd, dir, 3_600_000L) { } } catch (e: Exception) { ("Error: ${e.message}" to -1) }
+            s.reminders.add("Background command $id (`${cmd.take(100)}`) finished with exit code $code. Output tail:\n${out.takeLast(4000)}")
+            s.note("Perintah latar $id selesai (exit $code)")
+            if (!inForeground) Notify.done(ctx, "Perintah latar selesai")
+        }.start()
+        return id
+    }
+
+    fun isOnline(): Boolean = try {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        cm.getNetworkCapabilities(cm.activeNetwork)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    } catch (e: Exception) { true }
+
     fun answerAsk(allow: Boolean, always: Boolean) {
         val a = pendingAsk ?: return
         if (always && allow) ubahRules(rules + PermRule(a.group, "*", "allow"))
@@ -187,10 +224,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val base = try { ctx.assets.open("prompts/system.txt").bufferedReader().readText() } catch (e: Exception) { "Kamu adalah agen coding." }
         val root = File(s.root)
         val sb = StringBuilder(base)
-        sb.append("\n\n# Konteks sesi\n- Direktori proyek: ${s.root}\n- Perangkat: Android ${Build.VERSION.RELEASE}, ${Build.MODEL}\n- Tanggal: ${Agent.today()}\n")
+        sb.append("\n\n<env>\nWorking directory: ${s.root}\nPlatform: Android ${Build.VERSION.RELEASE} (${Build.MODEL}); shell: /system/bin/sh with toybox utilities only unless the user installed more\nBuild limitation: building an APK/AAB is normally not possible in this environment (no JDK, Gradle or Android SDK). Do not run gradle or assemble tasks unless the user explicitly asks; when the work is done, tell the user to build it themselves (Android Studio or CI).\nToday's date: ${Agent.today()}\n</env>\n")
         for (n in listOf("AGENTS.md", "CODEAGENT.md", "CLAUDE.md")) {
             val f = File(root, n)
             if (f.isFile) { sb.append("\n# Instruksi proyek ($n)\n").append(f.readText().take(12000)).append('\n'); break }
+        }
+        if (s.extraDirs.isNotEmpty()) {
+            sb.append("\n# Source projects (read-only)\nThese folders are source projects to copy features from. You may read and search them, but never modify them. Write all ported code into the current project and follow ITS structure and conventions:\n")
+            s.extraDirs.forEach { sb.append("- $it\n") }
         }
         val sk = allSkills(root)
         if (sk.isNotEmpty()) {
@@ -241,15 +282,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val name = text.substring(1).substringBefore(' ').lowercase()
         val args = text.substringAfter(' ', "").trim()
         when (name) {
-            "bantuan", "help" -> s.note("Perintah: /init, /model, /models, /effort <auto|low|medium|high>, /compact, /clear, /ekspor, /bantuan" +
+            "bantuan", "help" -> s.note("Perintah: /init, /plan, /build, /undo, /port <folder sumber> [fitur], /model, /effort <auto|low|medium|high>, /compact, /clear, /bantuan" +
                 (commands + projectCommands(s.root)).joinToString("") { ", /${it.name}" })
             "model", "models" -> showModelSheet = true
             "effort" -> if (args in listOf("auto", "low", "medium", "high")) { s.effort = args; persist(s); s.note("Tingkat penalaran sesi: $args") }
                 else s.note("Pakai: /effort auto|low|medium|high", true)
             "clear" -> { s.msgs.clear(); s.items.clear(); persist(s); s.note("Percakapan dibersihkan.") }
             "compact" -> compact(s)
+            "plan" -> switchAgent(s, "plan")
+            "build" -> switchAgent(s, "build")
+            "undo" -> undo(s)
+            "port" -> port(s, args)
             "init" -> {
-                launchRun(s, "Analisis proyek ini lalu buat/perbarui file AGENTS.md di root proyek berisi: ringkasan proyek, struktur folder penting, perintah build/tes/lint, konvensi kode, dan hal yang perlu diwaspadai. Baca dulu README, file konfigurasi build, dan CI bila ada. Tulis ringkas dan akurat dalam Bahasa Indonesia.")
+                launchRun(s, "Analyze this project and create or update AGENTS.md in the project root. It must be short and accurate, and contain only what a future agent could not guess: what the project is, the important folders, the exact build/test/lint commands (taken from the build files and CI config, not invented), code conventions you actually observed, and pitfalls. Read the README, build configuration and CI files first, and verify every command against them. If AGENTS.md already exists, improve it instead of replacing it. Write it in Indonesian.")
             }
             "ekspor" -> toast = "Gunakan menu ⋮ di atas chat untuk mengekspor."
             else -> {
@@ -262,6 +307,61 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         return true
+    }
+
+    fun switchAgent(s: ChatSession, agent: String) {
+        if (s.running) { toast = "Hentikan agen dulu sebelum mengganti mode."; return }
+        s.agent = agent; persist(s)
+        s.note(if (agent == "plan") "Mode Plan: agen hanya membaca dan merencanakan (tidak mengubah file)." else "Mode Build: agen boleh mengubah file dan menjalankan perintah.")
+    }
+
+    fun undo(s: ChatSession) {
+        if (s.running) { toast = "Hentikan agen dulu sebelum /undo."; return }
+        val idx = s.msgs.indexOfLast { it.role == "user" }
+        if (idx < 0) { s.note("Tidak ada yang bisa dibatalkan."); return }
+        val userText = s.msgs[idx].text.replace(Regex("(?s)<system-reminder>.*?</system-reminder>\\s*"), "").trim()
+        val recs = s.undoLog.filter { it.idx >= idx }
+        var n = 0
+        for (r in recs.asReversed()) {
+            try {
+                val f = File(r.path)
+                if (r.before == null) f.delete() else { f.parentFile?.mkdirs(); f.writeText(r.before) }
+                n++
+            } catch (e: Exception) { }
+        }
+        s.undoLog.removeAll { it.idx >= idx }
+        while (s.msgs.size > idx) s.msgs.removeAt(s.msgs.size - 1)
+        s.rebuild()
+        s.note("Dibatalkan: $n perubahan file dikembalikan dan giliran terakhir dihapus.")
+        persist(s)
+        prefill = userText
+    }
+
+    private fun port(s: ChatSession, args: String) {
+        val m = Regex("^\"([^\"]+)\"\\s*(.*)$|^(\\S+)\\s*(.*)$", RegexOption.DOT_MATCHES_ALL).find(args.trim())
+        val src = (m?.groupValues?.get(1)?.ifEmpty { null } ?: m?.groupValues?.get(3) ?: "").trim()
+        val what = (m?.groupValues?.get(2)?.ifEmpty { null } ?: m?.groupValues?.get(4) ?: "").trim()
+        if (src.isEmpty()) { s.note("Pakai: /port <folder proyek sumber> [fitur yang ingin disalin]", true); return }
+        if (!File(src).isDirectory) { s.note("Folder sumber tidak ditemukan: $src", true); return }
+        if (src !in s.extraDirs) s.extraDirs.add(src)
+        persist(s)
+        launchRun(s, "Port functionality from a SOURCE project into the TARGET project (the current working directory).\n\nSOURCE (read-only, never modify): $src\nTARGET: ${s.root}\nWhat to port: ${what.ifEmpty { "the main feature(s) the user wants; if unclear, inspect the SOURCE and ask with the question tool" }}\n\nWork in this order:\n1. Study the TARGET first: build files, manifest, AGENTS.md/README, package layout, naming, architecture and UI patterns.\n2. Study the requested feature in the SOURCE: entry points, data flow, resources, dependencies.\n3. Write TARGET-native code. Translate instead of copying: follow the TARGET's conventions and existing dependencies, and add a new library only when unavoidable.\n4. Wire everything up (manifest, navigation, dependency injection, resources, strings).\n5. Verify: re-read what you changed and run diagnostics.\n6. Finish with what was ported, what was adapted, and what the user must build or test.")
+    }
+
+    fun generateTitle(s: ChatSession) {
+        if (s.titled) return
+        val first = s.msgs.firstOrNull { it.role == "user" }?.text
+            ?.replace(Regex("(?s)<system-reminder>.*?</system-reminder>\\s*"), "")?.trim() ?: return
+        s.titled = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val c = candidates(s.model).firstOrNull() ?: return@launch
+                val t = Llm.complete(c.provider, c.key, c.model,
+                    "Write a short title (maximum 6 words, no quotes, no trailing punctuation) for a coding conversation that starts with the user's message below. Reply with the title only.",
+                    listOf(Msg("user", first.take(1500)))).trim().lines().first().trim('"', ' ', '.').take(60)
+                if (t.isNotBlank()) { s.title = t; persist(s) }
+            } catch (e: Exception) { }
+        }
     }
 
     private fun compact(s: ChatSession) {

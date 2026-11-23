@@ -41,6 +41,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.UUID
 
 // ---------- komponen kecil ----------
@@ -264,6 +265,9 @@ fun SettingsScreen(vm: AppViewModel) {
             Section("Penalaran") {
                 Text("Tingkat penalaran (default)", fontWeight = FontWeight.Medium)
                 Choice(listOf("auto" to "Otomatis", "low" to "Rendah", "medium" to "Sedang", "high" to "Tinggi"), vm.effort) { vm.ubahEffort(it) }
+                Text("Jendela konteks model", fontWeight = FontWeight.Medium)
+                Choice(listOf("32000" to "32K", "64000" to "64K", "128000" to "128K", "200000" to "200K", "1000000" to "1M"), vm.ctxWindow.toString()) { vm.ubahCtxWindow(it.toInt()) }
+                Hint("Dipakai untuk memadatkan percakapan otomatis: pada 60% output lama dipangkas, pada 75% percakapan diringkas.")
                 Hint("Berlaku untuk model penalaran gaya OpenAI-compatible (GPT-5/o-series, DeepSeek, Gemini). Ketik /effort low|medium|high di chat untuk mengubahnya hanya untuk sesi itu. Gaya Anthropic tidak memakai pengaturan ini.")
             }
 
@@ -325,6 +329,21 @@ fun SettingsScreen(vm: AppViewModel) {
                     Text("Akses penyimpanan", Modifier.weight(1f), fontSize = 16.sp)
                     Text(if (filesOk()) "AKTIF ✓" else "BELUM", color = if (filesOk()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
                         fontWeight = FontWeight.SemiBold)
+                }
+            }
+
+            Section("Log crash") {
+                var crash by remember { mutableStateOf(File(ctx.filesDir, "crash.log").let { if (it.exists()) it.readText() else "" }) }
+                if (crash.isEmpty()) Hint("Tidak ada crash tercatat.")
+                else {
+                    Text(crash.take(3500), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton({
+                            (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("crash", crash))
+                            toast("Log crash disalin")
+                        }) { Text("Salin") }
+                        OutlinedButton({ File(ctx.filesDir, "crash.log").delete(); crash = "" }) { Text("Hapus") }
+                    }
                 }
             }
 
