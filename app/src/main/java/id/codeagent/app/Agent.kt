@@ -2,6 +2,7 @@ package id.codeagent.app
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -99,6 +100,9 @@ object Agent {
         }
     }
 
+    private suspend fun chk() = currentCoroutineContext().ensureActive()
+    private suspend fun alive() = currentCoroutineContext().isActive
+
     private fun makeCtx(env: Env): ToolCtx {
         val vm = env.vm; val s = env.s
         return ToolCtx(File(s.root), { vm.allSkills(File(s.root)) }, { q -> vm.askQuestions(q) },
@@ -122,7 +126,7 @@ object Agent {
         cand@ for ((ci, c) in cands.withIndex()) {
             var tries = 0
             while (true) {
-                ensureActive()
+                chk()
                 val tb = StringBuilder(); val rb = StringBuilder()
                 if (env.ui) { s.items.removeAll { it.key == key }; s.items.add(ChatItem.Assistant(key, "", "")) }
                 try {
@@ -147,7 +151,7 @@ object Agent {
                     throw Exception("${c.provider.name} · ${c.model}: HTTP ${e.code}\n${e.message}")
                 } catch (e: SocketTimeoutException) {
                     s.items.removeAll { it.key == key }
-                    if (!isActive) throw CancellationException("dihentikan")
+                    if (!alive()) throw CancellationException("dihentikan")
                     if (tries++ < 2) {
                         env.small = true
                         if (env.ui) s.note("Balasan macet terlalu lama, mencoba lagi dengan mode keluaran kecil…")
@@ -156,7 +160,7 @@ object Agent {
                     throw Exception("Koneksi time-out (tidak ada data 120 detik). Coba model yang lebih cepat atau kirim \"lanjut\".")
                 } catch (e: IOException) {
                     s.items.removeAll { it.key == key }
-                    if (!isActive) throw CancellationException("dihentikan")
+                    if (!alive()) throw CancellationException("dihentikan")
                     if (Llm.looksOffline(e) && tries++ < 5) {
                         if (env.ui) s.note("Tidak ada jaringan. Menunggu koneksi kembali…")
                         var waited = 0
@@ -176,7 +180,7 @@ object Agent {
         env.msgs.add(Msg("assistant", r.text, r.calls))
         if (r.calls.isEmpty()) return false
         for (c in r.calls) {
-            ensureActive()
+            chk()
             val tk = Keys.next()
             if (env.ui) s.items.add(ChatItem.Tool(tk, c.name, Tools.title(c.name, c.args), "", "jalan"))
             var out: String
@@ -262,7 +266,7 @@ object Agent {
         sub.ctx = makeCtx(sub)
         var n = 0
         while (n++ < SUB_STEPS) {
-            ensureActive()
+            chk()
             if (!step(sub, false, "")) break
             if (sub.stuck) break
         }
